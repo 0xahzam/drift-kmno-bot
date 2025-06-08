@@ -163,13 +163,13 @@ export class TradingBot {
         log.cycle(this.cycleCount, "Holding current position", {
           current: this.getSignalString(currentSignal),
         });
+
+        // Only reconcile when we're NOT making position changes
+        await this.reconcilePosition();
       }
 
       // Log current state
       await this.logCurrentState();
-
-      // Reconcile positions
-      await this.reconcilePosition();
 
       this.state = BotState.HEALTHY;
     } catch (error) {
@@ -336,63 +336,62 @@ export class TradingBot {
         return;
       }
 
-      // Calculate what we should have vs what we actually have
-      const shouldHaveDrift = this.position?.drift || 0;
-      const shouldHaveKmno = this.position?.kmno || 0;
+      const targetSignal = this.position?.signal || 0;
+      const targetDrift = targetSignal * TRADING_CONFIG.DRIFT_QUANTITY;
+      const targetKmno = -targetSignal * TRADING_CONFIG.KMNO_QUANTITY;
       const actualDrift = exchangePosition?.drift || 0;
       const actualKmno = exchangePosition?.kmno || 0;
 
-      const driftDiff = actualDrift - shouldHaveDrift;
-      const kmnoDiff = actualKmno - shouldHaveKmno;
+      const driftDiff = Math.abs(actualDrift - targetDrift);
+      const kmnoDiff = Math.abs(actualKmno - targetKmno);
 
-      // If differences are minimal, we're good
-      if (Math.abs(driftDiff) <= 0.1 && Math.abs(kmnoDiff) <= 0.1) {
+      if (driftDiff <= 0.1 && kmnoDiff <= 0.1) {
+        this.position = exchangePosition;
         return;
       }
 
-      // Something's wrong - fix it
       log.position("Position reconciliation needed", {
-        should: { drift: shouldHaveDrift, kmno: shouldHaveKmno },
+        should: { drift: targetDrift, kmno: targetKmno },
         actual: { drift: actualDrift, kmno: actualKmno },
         corrections: { drift: driftDiff, kmno: kmnoDiff },
       });
 
-      await this.correctPositions(driftDiff, kmnoDiff);
-    } catch (error) {
-      log.error("RECONCILE", "Position reconciliation failed", error as Error);
-      this.state = BotState.EMERGENCY;
-    }
-  }
-
-  private async correctPositions(
-    driftDiff: number,
-    kmnoDiff: number
-  ): Promise<void> {
-    try {
-      // Correct DRIFT excess/deficit
-      if (Math.abs(driftDiff) > 0.1) {
-        const direction =
-          driftDiff > 0 ? PositionDirection.SHORT : PositionDirection.LONG;
-        await placeOrder("DRIFT", direction, Math.abs(driftDiff), true);
+      // Correct DRIFT position if needed
+      if (driftDiff > 0.1) {
+        let direction: PositionDirection;
+        if (actualDrift > targetDrift) {
+          // Too much DRIFT, need to sell/short
+          direction = PositionDirection.SHORT;
+        } else {
+          // Too little DRIFT, need to buy/long
+          direction = PositionDirection.LONG;
+        }
+        await placeOrder("DRIFT", direction, driftDiff, true);
       }
 
-      // Correct KMNO excess/deficit
-      if (Math.abs(kmnoDiff) > 0.1) {
-        const direction =
-          kmnoDiff > 0 ? PositionDirection.SHORT : PositionDirection.LONG;
-        await placeOrder("KMNO", direction, Math.abs(kmnoDiff), true);
+      // Correct KMNO position if needed
+      if (kmnoDiff > 0.1) {
+        let direction: PositionDirection;
+        if (actualKmno > targetKmno) {
+          // Too much KMNO, need to sell/short
+          direction = PositionDirection.SHORT;
+        } else {
+          // Too little KMNO, need to buy/long
+          direction = PositionDirection.LONG;
+        }
+        await placeOrder("KMNO", direction, kmnoDiff, true);
       }
 
-      // Update internal state after corrections
-      if (this.position) {
-        this.position.drift = (this.position.drift || 0) - driftDiff;
-        this.position.kmno = (this.position.kmno || 0) - kmnoDiff;
-      }
+      this.position = {
+        drift: targetDrift,
+        kmno: targetKmno,
+        signal: targetSignal,
+      };
 
       log.position("Position correction completed");
     } catch (error) {
-      log.error("CORRECT", "Failed to correct positions", error as Error);
-      throw error;
+      log.error("RECONCILE", "Position reconciliation failed", error as Error);
+      this.state = BotState.EMERGENCY;
     }
   }
   // Log current state
