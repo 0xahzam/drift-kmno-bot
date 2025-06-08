@@ -17,7 +17,7 @@ const logger = winston.createLogger({
   format: format,
   transports: [
     new winston.transports.Console(),
-    new winston.transports.File({ filename: "trading.log" }),
+    new winston.transports.File({ filename: "bot.log" }),
   ],
 });
 

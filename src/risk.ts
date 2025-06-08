@@ -1,5 +1,4 @@
 import { RISK_CONFIG } from "./config";
-import { log } from "./logger";
 import type { Result, LiquidityCheck } from "./types";
 
 // Slippage validation
@@ -57,57 +56,4 @@ export function validateTrade(
   }
 
   return { success: true, data: undefined };
-}
-
-// Position reconciliation validation
-export function validatePositionReconciliation(
-  internalPosition: Position | null,
-  exchangePosition: Position | null,
-  tolerance: number = 0.1
-): Result<{ needsCorrection: boolean; corrections?: Position }> {
-  // No positions on either side
-  if (!internalPosition && !exchangePosition) {
-    return { success: true, data: { needsCorrection: false } };
-  }
-
-  // Position exists only on one side
-  if (!internalPosition || !exchangePosition) {
-    log.risk("Position mismatch detected", {
-      internal: internalPosition,
-      exchange: exchangePosition,
-    });
-    return {
-      success: true,
-      data: {
-        needsCorrection: true,
-        corrections: exchangePosition || undefined,
-      },
-    };
-  }
-
-  // Check for drift in position sizes
-  //@ts-ignore
-  const driftDiff = Math.abs(internalPosition.drift - exchangePosition.drift);
-  //@ts-ignore
-  const kmnoDiff = Math.abs(internalPosition.kmno - exchangePosition.kmno);
-
-  if (driftDiff > tolerance || kmnoDiff > tolerance) {
-    log.risk("Position drift detected", {
-      driftDiff,
-      kmnoDiff,
-      tolerance,
-      internal: internalPosition,
-      exchange: exchangePosition,
-    });
-
-    return {
-      success: true,
-      data: {
-        needsCorrection: true,
-        corrections: exchangePosition,
-      },
-    };
-  }
-
-  return { success: true, data: { needsCorrection: false } };
 }

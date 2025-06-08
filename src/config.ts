@@ -4,7 +4,6 @@ import { log } from "./logger";
 // Load environment variables
 const RPC_HTTP = Bun.env.RPC_ENDPOINT;
 const RPC_WS = Bun.env.RPC_WS;
-const PUBLIC_KEY = Bun.env.PUBLIC_KEY;
 const PRIVATE_KEY = Bun.env.PRIVATE_KEY;
 
 // Validation with proper logging
@@ -49,7 +48,6 @@ export const RISK_CONFIG = {
 export const config = {
   RPC_HTTP,
   RPC_WS,
-  PUBLIC_KEY,
   PRIVATE_KEY,
 };
 

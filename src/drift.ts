@@ -318,8 +318,12 @@ export async function getAccountState(): Promise<Result<AccountState>> {
       user.getUnrealizedPNL(),
     ].map((n) => Number(n) / Number(QUOTE_PRECISION));
 
-    if (!totalCollateral || !freeCollateral || !unrealizedPnL)
-      throw new Error();
+    if (
+      totalCollateral === undefined ||
+      freeCollateral === undefined ||
+      unrealizedPnL === undefined
+    )
+      throw new Error("Failed to parse account values");
 
     return {
       success: true,

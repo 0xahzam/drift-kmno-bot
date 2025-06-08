@@ -2,31 +2,33 @@
 export type Signal = -1 | 0 | 1; // Short, Flat, Long
 
 // Position state
-export interface Position {
+export type Position = {
   drift: number;
   kmno: number;
   signal: Signal;
-}
+  [key: string]: any;
+};
 
 // Bot operational states
-export type BotState =
-  | "INITIALIZING"
-  | "HEALTHY"
-  | "DEGRADED" // Partial functionality (stale data, etc.)
-  | "RISK_BREACH" // Risk limits hit, reduce-only mode
-  | "EMERGENCY" // Critical failure, close all positions
-  | "SHUTDOWN";
+export enum BotState {
+  INITIALIZING = "INITIALIZING",
+  HEALTHY = "HEALTHY",
+  DEGRADED = "DEGRADED", // Partial functionality (stale data, etc.)
+  RISK_BREACH = "RISK_BREACH", // Risk limits hit, reduce-only mode
+  EMERGENCY = "EMERGENCY", // Critical failure, close all positions
+  SHUTDOWN = "SHUTDOWN",
+}
 
 // Market data
-export interface CandleData {
+export type CandleData = {
   oracleClose: number;
   timestamp?: number;
-}
+};
 
-export interface LiquidityCheck {
+export type LiquidityCheck = {
   canFill: boolean;
   estimatedSlippage: number;
-}
+};
 
 // Result type for error handling
 export type Result<T, E = string> =
@@ -34,16 +36,8 @@ export type Result<T, E = string> =
   | { success: false; error: E };
 
 // Account state
-export interface AccountState {
+export type AccountState = {
   totalCollateral: number;
   freeCollateral: number;
   unrealizedPnL: number;
-}
-
-// Risk metrics
-export interface RiskMetrics {
-  positionSize: number;
-  leverage: number;
-  dailyPnL: number;
-  maxDrawdown: number;
-}
+};

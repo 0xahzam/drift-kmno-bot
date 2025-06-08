@@ -75,19 +75,6 @@ async function main(): Promise<void> {
     bot.start();
 
     log.cycle(0, "Trading bot is now running");
-
-    // Keep process alive and log status periodically
-    setInterval(() => {
-      const status = bot?.getStatus();
-      if (status) {
-        log.cycle(0, "Bot status", {
-          state: status.state,
-          cycleCount: status.cycleCount,
-          hasPosition: !!status.position,
-          isRunning: status.isRunning,
-        });
-      }
-    }, 60000); // Log status every minute
   } catch (error) {
     log.error("MAIN", "Fatal error in main", error as Error);
     process.exit(1);

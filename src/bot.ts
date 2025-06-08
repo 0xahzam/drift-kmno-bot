@@ -12,10 +12,11 @@ import {
   cleanup,
 } from "./drift";
 import { PositionDirection } from "@drift-labs/sdk";
-import type { BotState, Result, Signal } from "./types";
+import type { Position, Result, Signal } from "./types";
+import { BotState } from "./types";
 
 export class TradingBot {
-  private state: BotState = "INITIALIZING";
+  private state: BotState = BotState.INITIALIZING;
   private position: Position | null = null;
   private cycleCount = 0;
   private isCycleRunning = false;
@@ -32,15 +33,15 @@ export class TradingBot {
         return driftInit;
       }
 
-      // Reconcile position state on startup
-      await this.reconcilePosition();
+      // Reconstruct position state from exchange on startup
+      await this.reconstructPositionState();
 
-      this.state = "HEALTHY";
+      this.state = BotState.HEALTHY;
       log.cycle(0, "Bot initialized successfully", { state: this.state });
 
       return { success: true, data: undefined };
     } catch (error) {
-      this.state = "EMERGENCY";
+      this.state = BotState.EMERGENCY;
       return {
         success: false,
         error: `Bot initialization failed: ${(error as Error).message}`,
@@ -50,7 +51,7 @@ export class TradingBot {
 
   // Start trading operations
   start(): void {
-    if (this.state !== "HEALTHY") {
+    if (this.state !== BotState.HEALTHY) {
       log.error(
         "BOT",
         "Cannot start bot in non-healthy state",
@@ -113,7 +114,7 @@ export class TradingBot {
       log.cycle(this.cycleCount, "Cycle started");
 
       // Health check
-      if (this.state === "EMERGENCY") {
+      if (this.state === BotState.EMERGENCY) {
         log.cycle(this.cycleCount, "Bot in emergency state, closing positions");
         await this.closePosition();
         return;
@@ -127,7 +128,7 @@ export class TradingBot {
           "Failed to fetch market data",
           new Error(marketDataResult.error)
         );
-        this.state = "DEGRADED";
+        this.state = BotState.DEGRADED;
         return;
       }
 
@@ -155,7 +156,6 @@ export class TradingBot {
       });
 
       // Determine if position change is needed
-      //@ts-ignore
       const currentSignal = this.position?.signal || 0;
       if (shouldChangePosition(currentSignal, signal)) {
         await this.transitionPosition(signal);
@@ -168,15 +168,13 @@ export class TradingBot {
       // Log current state
       await this.logCurrentState();
 
-      // Reconcile positions periodically
-      if (this.cycleCount % 10 === 0) {
-        await this.reconcilePosition();
-      }
+      // Reconcile positions
+      await this.reconcilePosition();
 
-      this.state = "HEALTHY";
+      this.state = BotState.HEALTHY;
     } catch (error) {
       log.error("CYCLE", `Cycle ${this.cycleCount} failed`, error as Error);
-      this.state = "DEGRADED";
+      this.state = BotState.DEGRADED;
     } finally {
       const cycleTime = Number(process.hrtime.bigint() - cycleStart) / 1e6;
       log.cycle(this.cycleCount, "Cycle completed", {
@@ -188,7 +186,6 @@ export class TradingBot {
 
   // Transition between positions
   private async transitionPosition(newSignal: Signal): Promise<void> {
-    //@ts-ignore
     const currentSignal = this.position?.signal || 0;
     const currentStr = this.getSignalString(currentSignal);
     const newStr = this.getSignalString(newSignal);
@@ -210,7 +207,7 @@ export class TradingBot {
       }
     } catch (error) {
       log.error("TRANSITION", "Position transition failed", error as Error);
-      this.state = "EMERGENCY";
+      this.state = BotState.EMERGENCY;
     }
   }
 
@@ -253,7 +250,6 @@ export class TradingBot {
 
       // Update internal state
       this.position = {
-        //@ts-ignore
         drift: signal * TRADING_CONFIG.DRIFT_QUANTITY,
         kmno: -signal * TRADING_CONFIG.KMNO_QUANTITY,
         signal,
@@ -281,31 +277,25 @@ export class TradingBot {
 
     try {
       // Close DRIFT position
-      //@ts-ignore
       if (this.position.drift !== 0) {
         const direction =
-          //@ts-ignore
           this.position.drift > 0
             ? PositionDirection.SHORT
             : PositionDirection.LONG;
         await placeOrder(
           "DRIFT",
           direction,
-          //@ts-ignore
           Math.abs(this.position.drift),
           true
         );
       }
 
       // Close KMNO position
-      //@ts-ignore
       if (this.position.kmno !== 0) {
         const direction =
-          //@ts-ignore
           this.position.kmno > 0
             ? PositionDirection.SHORT
             : PositionDirection.LONG;
-        //@ts-ignore
         await placeOrder("KMNO", direction, Math.abs(this.position.kmno), true);
       }
 
@@ -317,48 +307,14 @@ export class TradingBot {
     }
   }
 
-  private async correctPositionDiscrepancy(
-    internal: Position,
-    exchange: Position
-  ): Promise<void> {
-    //@ts-ignore
-    const driftDiff = exchange.drift - internal.drift;
-    //@ts-ignore
-    const kmnoDiff = exchange.kmno - internal.kmno;
-
-    log.position("Correcting position discrepancies", {
-      driftDiff,
-      kmnoDiff,
-      internal,
-      exchange,
-    });
-
-    try {
-      // Correct DRIFT excess
-      if (Math.abs(driftDiff) > 0.1) {
-        const direction =
-          driftDiff > 0 ? PositionDirection.SHORT : PositionDirection.LONG;
-        await placeOrder("DRIFT", direction, Math.abs(driftDiff), true);
-        log.position(`Corrected DRIFT excess: ${driftDiff}`);
-      }
-
-      // Correct KMNO excess
-      if (Math.abs(kmnoDiff) > 0.1) {
-        const direction =
-          kmnoDiff > 0 ? PositionDirection.SHORT : PositionDirection.LONG;
-        await placeOrder("KMNO", direction, Math.abs(kmnoDiff), true);
-        log.position(`Corrected KMNO excess: ${kmnoDiff}`);
-      }
-
-      log.position("Position correction completed");
-    } catch (error) {
-      log.error(
-        "CORRECT",
-        "Failed to correct position discrepancy",
-        error as Error
-      );
-      this.state = "EMERGENCY";
-      throw error;
+  private async reconstructPositionState(): Promise<void> {
+    const exchangeResult = await getCurrentPositions();
+    if (exchangeResult.success && exchangeResult.data) {
+      this.position = exchangeResult.data;
+      log.cycle(0, "Reconstructed position from exchange", this.position);
+    } else {
+      this.position = null;
+      log.cycle(0, "No existing positions found");
     }
   }
 
@@ -376,10 +332,12 @@ export class TradingBot {
 
       const exchangePosition = exchangeResult.data;
 
+      if (!this.position && !exchangePosition) {
+        return;
+      }
+
       // Calculate what we should have vs what we actually have
-      //@ts-ignore
       const shouldHaveDrift = this.position?.drift || 0;
-      //@ts-ignore
       const shouldHaveKmno = this.position?.kmno || 0;
       const actualDrift = exchangePosition?.drift || 0;
       const actualKmno = exchangePosition?.kmno || 0;
@@ -402,7 +360,7 @@ export class TradingBot {
       await this.correctPositions(driftDiff, kmnoDiff);
     } catch (error) {
       log.error("RECONCILE", "Position reconciliation failed", error as Error);
-      this.state = "EMERGENCY";
+      this.state = BotState.EMERGENCY;
     }
   }
 
@@ -423,6 +381,12 @@ export class TradingBot {
         const direction =
           kmnoDiff > 0 ? PositionDirection.SHORT : PositionDirection.LONG;
         await placeOrder("KMNO", direction, Math.abs(kmnoDiff), true);
+      }
+
+      // Update internal state after corrections
+      if (this.position) {
+        this.position.drift = (this.position.drift || 0) - driftDiff;
+        this.position.kmno = (this.position.kmno || 0) - kmnoDiff;
       }
 
       log.position("Position correction completed");
