@@ -366,7 +366,8 @@ export class TradingBot {
           // Too little DRIFT, need to buy/long
           direction = PositionDirection.LONG;
         }
-        await placeOrder("DRIFT", direction, driftDiff, true);
+        // Reduce=false because may need to open position
+        await placeOrder("DRIFT", direction, driftDiff, false);
       }
 
       // Correct KMNO position if needed
@@ -379,7 +380,9 @@ export class TradingBot {
           // Too little KMNO, need to buy/long
           direction = PositionDirection.LONG;
         }
-        await placeOrder("KMNO", direction, kmnoDiff, true);
+
+        // Reduce=false because may need to open position
+        await placeOrder("KMNO", direction, kmnoDiff, false);
       }
 
       this.position = {

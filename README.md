@@ -5,8 +5,8 @@ Automated spread trading bot for DRIFT/KMNO perpetuals on Drift Protocol.
 ## Strategy
 
 Market-neutral spread trading:
-- **LONG**: Buy DRIFT (100) + Sell KMNO (1000)
-- **SHORT**: Sell DRIFT (100) + Buy KMNO (1000)
+- **LONG**: Buy DRIFT (10) + Sell KMNO (100)
+- **SHORT**: Sell DRIFT (10) + Buy KMNO (100)
 - **FLAT**: No positions
 
 Signal based on convergence/divergence behaviour showed by the pair and validated with backtest.

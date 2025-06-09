@@ -31,7 +31,7 @@ export const TRADING_CONFIG = {
   KMNO_QUANTITY: 100,
   PRICE_RATIO: 10,
   SIGNAL_LAG_PERIODS: 2,
-  CYCLE_INTERVAL_MS: 7 * 900_000, // 15min
+  CYCLE_INTERVAL_MS: 7 * 900_000, // 7 * 15min
   SIMULATION_MODE: false,
   ENV: "mainnet-beta" as const,
 };
