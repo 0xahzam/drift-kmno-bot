@@ -216,35 +216,58 @@ export async function placeOrder(
     return { success: true, data: "simulation-tx" };
   }
 
-  try {
-    const marketConfig = marketMap.get(market);
-    if (!marketConfig) {
-      return { success: false, error: `Market config not found for ${market}` };
+  // Exponential Retry
+  for (let attempt = 1; attempt <= RISK_CONFIG.MAX_RETRIES; attempt++) {
+    try {
+      const marketConfig = marketMap.get(market);
+      if (!marketConfig) {
+        return {
+          success: false,
+          error: `Market config not found for ${market}`,
+        };
+      }
+
+      const tx = await driftClient.placePerpOrder({
+        orderType: OrderType.MARKET,
+        marketIndex: marketConfig.marketIndex,
+        direction,
+        baseAssetAmount: new BN(quantity).mul(BASE_PRECISION),
+        reduceOnly,
+      });
+
+      const action = reduceOnly ? "CLOSE" : "OPEN";
+      const directionStr =
+        direction === PositionDirection.LONG ? "LONG" : "SHORT";
+      log.order(action, market, `Order placed: ${directionStr} ${quantity}`, {
+        txSignature: tx,
+        marketIndex: marketConfig.marketIndex,
+      });
+
+      return { success: true, data: tx };
+    } catch (error) {
+      if (attempt === RISK_CONFIG.MAX_RETRIES) {
+        return {
+          success: false,
+          error: `Order placement failed after ${attempt} attempts: ${
+            (error as Error).message
+          }`,
+        };
+      }
+
+      const delay = RISK_CONFIG.RETRY_DELAY_MS * Math.pow(2, attempt - 1);
+      log.error(
+        "ORDER",
+        `Order attempt ${attempt} failed, retrying in ${delay}ms`,
+        error as Error
+      );
+      await new Promise((resolve) => setTimeout(resolve, delay));
     }
-
-    const tx = await driftClient.placePerpOrder({
-      orderType: OrderType.MARKET,
-      marketIndex: marketConfig.marketIndex,
-      direction,
-      baseAssetAmount: new BN(quantity).mul(BASE_PRECISION),
-      reduceOnly,
-    });
-
-    const action = reduceOnly ? "CLOSE" : "OPEN";
-    const directionStr =
-      direction === PositionDirection.LONG ? "LONG" : "SHORT";
-    log.order(action, market, `Order placed: ${directionStr} ${quantity}`, {
-      txSignature: tx,
-      marketIndex: marketConfig.marketIndex,
-    });
-
-    return { success: true, data: tx };
-  } catch (error) {
-    return {
-      success: false,
-      error: `Order placement failed: ${(error as Error).message}`,
-    };
   }
+
+  return {
+    success: false,
+    error: "Retry logic failed unexpectedly",
+  };
 }
 
 // Get current positions from exchange
