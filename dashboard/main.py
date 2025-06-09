@@ -110,7 +110,7 @@ def create_dashboard():
         ),
         specs=[
             [{"secondary_y": False}, {"secondary_y": False}],
-            [{"secondary_y": False}, {"secondary_y": True}],
+            [{"secondary_y": True}, {"secondary_y": True}],
         ],
     )
 
@@ -165,9 +165,11 @@ def create_dashboard():
             y=market_df["kmnoPrice"],
             name="KMNO",
             line=dict(color="#9467bd"),
+            yaxis="y4"
         ),
         row=2,
         col=1,
+        secondary_y=True,
     )
 
     # Spread
