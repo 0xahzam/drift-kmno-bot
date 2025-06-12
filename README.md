@@ -4,27 +4,22 @@ Automated spread trading bot for DRIFT/KMNO perpetuals on Drift Protocol.
 
 ## Strategy
 
-Market-neutral spread trading:
+Market-neutral spread trading based on price ratio deviations:
 
-- **LONG**: Buy DRIFT (10) + Sell KMNO (100)
-- **SHORT**: Sell DRIFT (10) + Buy KMNO (100)
-- **FLAT**: No positions
+- **LONG**: Buy DRIFT (10) + Sell KMNO (100) when spread < 0
+- **SHORT**: Sell DRIFT (10) + Buy KMNO (100) when spread > 0
+- **FLAT**: No positions when spread = 0
 
-Signal based on convergence/divergence behaviour showed by the pair and validated with backtest.
+Signal: `drift_price - (10 * kmno_price)` with 2-period lag for stability.
 
 ## Setup
 
 ```bash
 bun i
 cp .env.example .env
-# Set PRIVATE_KEY and RPC
+# Set PRIVATE_KEY, RPC_ENDPOINT, RPC_WS, AUTHORITY_KEY
 bun start
 ```
-
-**Required env vars:**
-
-- `PRIVATE_KEY`: Solana wallet (base64 or JSON array)
-- `RPC_URL`: Solana RPC endpoint
 
 ## Configuration
 
@@ -32,11 +27,11 @@ Edit `config.ts`:
 
 ```typescript
 TRADING_CONFIG = {
-	DRIFT_QUANTITY: 100, // Fixed position size
-	KMNO_QUANTITY: 1000,
-	CYCLE_INTERVAL_MS: 60000, // 1 minute
-	SIGNAL_LAG_PERIODS: 3, // Signal confirmation
-	SIMULATION_MODE: false, // Paper trading
+	DRIFT_QUANTITY: 10, // DRIFT position size
+	KMNO_QUANTITY: 100, // KMNO position size
+	PRICE_RATIO: 10, // Spread multiplier
+	CYCLE_INTERVAL_MS: 6300000, // 105 minutes
+	SIGNAL_LAG_PERIODS: 2, // Signal confirmation
 };
 
 RISK_CONFIG = {
@@ -48,61 +43,43 @@ RISK_CONFIG = {
 ## Architecture
 
 ```
-signal.ts     # Pure signal calculations
-risk.ts       # Slippage/liquidity validation
-drift.ts      # Drift protocol integration
-bot.ts        # State machine + position management
-main.ts       # Entry point
+signal.ts    # Real-time spread calculation
+bot.ts       # Dual-leg position management
+types.ts     # Clean type definitions
+logger.ts    # Performance snapshots
+main.ts      # Graceful shutdown
+config.ts    # Trading parameters
 ```
 
-## Position Management
+## Features
 
-**Reconciliation (every 10 cycles):**
-
-- Compares internal vs exchange positions
-- Auto-corrects size drift (e.g., 2x position → reduces by half)
-- Closes unexpected positions
-- Recreates missing positions
-
-**States:**
-
-- `HEALTHY`: Normal operation
-- `DEGRADED`: Minor issues, continue trading
-- `EMERGENCY`: Critical error, close all positions
+- **Real-time signals**: Fresh spread data every cycle
+- **Dual-leg execution**: Sequential DRIFT + KMNO orders
+- **Position reconciliation**: Auto-corrects position drift
+- **PnL tracking**: Strategy-specific performance
+- **Liquidity validation**: Both legs checked before execution
+- **Emergency handling**: Auto-close on critical errors
 
 ## Monitoring
 
 **Key logs:**
 
 ```bash
-# Errors
-grep '"level":"error"' bot.log
-
-# Position changes
-grep '"category":"POSITION"' bot.log
-
-# Cycle performance
-grep '"duration"' bot.log
+grep "Signal retrieved" bot.log     # Spread signals
+grep "realized PnL" bot.log         # Position closes
+grep "EMERGENCY" bot.log            # Critical errors
 ```
 
-**Graceful shutdown:**
+**Performance tracking:**
 
-```bash
-kill -TERM <pid>  # Closes positions before exit
-```
+- Account equity vs strategy equity
+- Realized PnL per position close
+- Slippage on both legs
 
 ## Risk Controls
 
-- Fixed position sizes (no sizing algorithms)
-- Slippage validation before orders
+- Fixed position sizes (10 DRIFT, 100 KMNO)
+- Pre-trade liquidity validation
 - Position reconciliation prevents drift
-- Emergency state on critical errors
-- Market orders only (no complex order types)
-
-## Production Notes
-
-- Bot auto-recovers from most errors
-- Position reconciliation handles exchange glitches
-- All functions return explicit `Result<T>` types
-- Structured JSON logging with correlation IDs
-- Set `SIMULATION_MODE=true` for testing
+- Market orders with retry logic
+- Graceful shutdown closes positions
