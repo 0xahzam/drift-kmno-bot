@@ -1,0 +1,6 @@
+# .prettierignore
+.venv/
+node_modules/
+dist/
+build/
+*.log

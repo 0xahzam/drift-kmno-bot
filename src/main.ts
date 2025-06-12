@@ -1,88 +1,63 @@
-import { TradingBot } from "./bot";
-import { log } from "./logger";
+import { SpreadBot } from './bot';
+import { log } from './logger';
 
-// Global bot instance
-let bot: TradingBot | null = null;
+let bot: SpreadBot | null = null;
 let isShuttingDown = false;
 
-// Graceful shutdown handler
 async function shutdown(signal: string): Promise<void> {
-  if (isShuttingDown) {
-    log.cycle(0, "Shutdown already in progress, ignoring signal", { signal });
-    return;
-  }
+	if (isShuttingDown) return;
 
-  isShuttingDown = true;
-  log.cycle(0, "Graceful shutdown initiated", { signal });
+	isShuttingDown = true;
+	log.cycle(0, 'Shutdown initiated', { signal });
 
-  try {
-    if (bot) {
-      await bot.stop();
-    }
-
-    log.cycle(0, "Shutdown completed successfully");
-    process.exit(0);
-  } catch (error) {
-    log.error("SHUTDOWN", "Error during shutdown", error as Error);
-    process.exit(1);
-  }
+	try {
+		if (bot) {
+			await bot.stop();
+		}
+		log.cycle(0, 'Shutdown completed');
+		process.exit(0);
+	} catch (error) {
+		log.error('SHUTDOWN', 'Shutdown failed', error as Error);
+		process.exit(1);
+	}
 }
 
-// Setup signal handlers
-function setupSignalHandlers(): void {
-  process.on("SIGINT", () => shutdown("SIGINT"));
-  process.on("SIGTERM", () => shutdown("SIGTERM"));
-
-  // Handle uncaught exceptions
-  process.on("uncaughtException", (error) => {
-    log.error("FATAL", "Uncaught exception", error);
-    shutdown("UNCAUGHT_EXCEPTION");
-  });
-
-  // Handle unhandled rejections
-  process.on("unhandledRejection", (reason, promise) => {
-    log.error(
-      "FATAL",
-      "Unhandled promise rejection",
-      new Error(String(reason))
-    );
-    shutdown("UNHANDLED_REJECTION");
-  });
-}
-
-// Main function
 async function main(): Promise<void> {
-  try {
-    log.cycle(0, "Trading bot starting up");
+	try {
+		log.cycle(0, 'Momentum bot starting');
 
-    // Setup signal handlers
-    setupSignalHandlers();
+		process.on('SIGINT', () => shutdown('SIGINT'));
+		process.on('SIGTERM', () => shutdown('SIGTERM'));
+		process.on('uncaughtException', (error) => {
+			log.error('FATAL', 'Uncaught exception', error);
+			shutdown('UNCAUGHT_EXCEPTION');
+		});
+		process.on('unhandledRejection', (reason) => {
+			log.error('FATAL', 'Unhandled rejection', new Error(String(reason)));
+			shutdown('UNHANDLED_REJECTION');
+		});
 
-    // Create and initialize bot
-    bot = new TradingBot();
+		bot = new SpreadBot();
 
-    const initResult = await bot.initialize();
-    if (!initResult.success) {
-      log.error(
-        "MAIN",
-        "Bot initialization failed",
-        new Error(initResult.error)
-      );
-      process.exit(1);
-    }
+		const initResult = await bot.initialize();
+		if (!initResult.success) {
+			log.error(
+				'MAIN',
+				'Bot initialization failed',
+				new Error(initResult.error)
+			);
+			process.exit(1);
+		}
 
-    // Start trading
-    bot.start();
-
-    log.cycle(0, "Trading bot is now running");
-  } catch (error) {
-    log.error("MAIN", "Fatal error in main", error as Error);
-    process.exit(1);
-  }
+		bot.start();
+		log.cycle(0, 'Momentum bot running');
+	} catch (error) {
+		log.error('MAIN', 'Fatal error', error as Error);
+		process.exit(1);
+	}
 }
 
-// Start the application
 main().catch((error) => {
-  log.error("MAIN", "Unhandled error in main", error as Error);
-  process.exit(1);
+	log.error('MAIN', 'Unhandled main error', error as Error);
+	process.exit(1);
 });

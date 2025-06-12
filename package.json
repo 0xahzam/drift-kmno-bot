@@ -1,20 +1,21 @@
 {
-  "name": "drift-kmno-spread",
-  "module": "index.ts",
-  "type": "module",
-  "private": true,
-  "scripts": {
-    "start": "bun run src/main.ts"
-  },
-  "devDependencies": {
-    "@types/bun": "latest"
-  },
-  "peerDependencies": {
-    "typescript": "^5"
-  },
-  "dependencies": {
-    "@drift-labs/sdk": "^2.123.0-beta.0",
-    "@solana/web3.js": "^1.98.2",
-    "winston": "^3.17.0"
-  }
+	"name": "drift-kmno-spread",
+	"module": "index.ts",
+	"type": "module",
+	"private": true,
+	"scripts": {
+		"start": "bun run src/main.ts",
+		"format": "prettier --write ."
+	},
+	"devDependencies": {
+		"@types/bun": "latest"
+	},
+	"peerDependencies": {
+		"typescript": "^5"
+	},
+	"dependencies": {
+		"@drift-labs/sdk": "^2.123.0-beta.0",
+		"@solana/web3.js": "^1.98.2",
+		"winston": "^3.17.0"
+	}
 }

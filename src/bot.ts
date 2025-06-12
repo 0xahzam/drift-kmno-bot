@@ -1,428 +1,863 @@
-import { TRADING_CONFIG } from "./config";
-import { log } from "./logger";
-import { calculateSignal, shouldChangePosition } from "./signal";
-import { validateTrade } from "./risk";
+import { getSpreadSignal } from './signal';
+import type {
+	Signal,
+	LiquidityCheck,
+	PerformanceSnapshot,
+	SpreadPosition,
+} from './types';
+import { log } from './logger';
+import { TRADING_CONFIG, RISK_CONFIG, config } from './config';
 import {
-  initializeDrift,
-  fetchMarketData,
-  checkLiquidity,
-  placeOrder,
-  getCurrentPositions,
-  getAccountState,
-  cleanup,
-} from "./drift";
-import { PositionDirection } from "@drift-labs/sdk";
-import type { Position, Result, Signal } from "./types";
-import { BotState } from "./types";
+	DriftClient,
+	Wallet,
+	initialize,
+	BulkAccountLoader,
+	PerpMarkets,
+	OrderType,
+	PositionDirection,
+	BASE_PRECISION,
+	QUOTE_PRECISION,
+	BN,
+	type PerpMarketAccount,
+} from '@drift-labs/sdk';
+import { Keypair, PublicKey } from '@solana/web3.js';
+import { Connection } from '@solana/web3.js';
 
-export class TradingBot {
-  private state: BotState = BotState.INITIALIZING;
-  private position: Position | null = null;
-  private cycleCount = 0;
-  private isCycleRunning = false;
-  private cycleInterval: NodeJS.Timeout | null = null;
+let driftClient: DriftClient;
+let driftMarketIndex: number;
+let kmnoMarketIndex: number;
 
-  // Initialize the bot
-  async initialize(): Promise<Result<void>> {
-    try {
-      log.cycle(0, "Bot initialization started");
+// Cache frequently used values
+const BASE_PRECISION_NUM = BASE_PRECISION.toNumber();
+const QUOTE_PRECISION_NUM = QUOTE_PRECISION.toNumber();
+const DRIFT_QUANTITY_SCALED =
+	TRADING_CONFIG.DRIFT_QUANTITY * BASE_PRECISION_NUM;
+const KMNO_QUANTITY_SCALED = TRADING_CONFIG.KMNO_QUANTITY * BASE_PRECISION_NUM;
+const MAX_SLIPPAGE_DECIMAL = RISK_CONFIG.MAX_SLIPPAGE_BPS / 10000;
+const CLOSE_MAX_SLIPPAGE_DECIMAL = RISK_CONFIG.CLOSE_MAX_SLIPPAGE_BPS / 10000;
 
-      // Initialize Drift client
-      const driftInit = await initializeDrift();
-      if (!driftInit.success) {
-        return driftInit;
-      }
+// Pre-computed signal strings
+const SIGNAL_STRINGS = ['SHORT', 'FLAT', 'LONG'] as const;
+const getSignalString = (signal: Signal): string => SIGNAL_STRINGS[signal + 1]!;
 
-      // Reconstruct position state from exchange on startup
-      await this.reconstructPositionState();
+enum BotState {
+	INITIALIZING = 'INITIALIZING',
+	HEALTHY = 'HEALTHY',
+	EMERGENCY = 'EMERGENCY',
+	SHUTDOWN = 'SHUTDOWN',
+}
 
-      this.state = BotState.HEALTHY;
-      log.cycle(0, "Bot initialized successfully", { state: this.state });
+export class SpreadBot {
+	private state: BotState = BotState.INITIALIZING;
+	private currentPosition: SpreadPosition | null = null;
+	private cycleCount = 0;
+	private isCycleRunning = false;
+	private cycleInterval: NodeJS.Timeout | null = null;
 
-      return { success: true, data: undefined };
-    } catch (error) {
-      this.state = BotState.EMERGENCY;
-      return {
-        success: false,
-        error: `Bot initialization failed: ${(error as Error).message}`,
-      };
-    }
-  }
+	private strategyStartingEquity: number = 0;
+	private strategyRealizedPnl: number = 0;
 
-  // Start trading operations
-  start(): void {
-    if (this.state !== BotState.HEALTHY) {
-      log.error(
-        "BOT",
-        "Cannot start bot in non-healthy state",
-        new Error(`Current state: ${this.state}`)
-      );
-      return;
-    }
+	async initialize(): Promise<{ success: boolean; error?: string }> {
+		try {
+			log.cycle(0, 'Spread bot initialization started');
 
-    log.cycle(0, "Starting trading operations");
+			const driftInit = await this.initializeDrift();
+			if (!driftInit.success) return driftInit;
 
-    // Run first cycle immediately
-    this.executeCycle();
+			log.cycle(0, 'Configuration loaded', {
+				driftQuantity: TRADING_CONFIG.DRIFT_QUANTITY,
+				kmnoQuantity: TRADING_CONFIG.KMNO_QUANTITY,
+				priceRatio: TRADING_CONFIG.PRICE_RATIO,
+				cycleInterval: `${TRADING_CONFIG.CYCLE_INTERVAL_MS / 1000}s`,
+				env: TRADING_CONFIG.ENV,
+			});
 
-    // Schedule periodic cycles
-    this.cycleInterval = setInterval(() => {
-      this.executeCycle();
-    }, TRADING_CONFIG.CYCLE_INTERVAL_MS);
-  }
+			const user = driftClient.getUser();
+			this.strategyStartingEquity =
+				user.getTotalCollateral().toNumber() / QUOTE_PRECISION_NUM;
 
-  // Stop trading operations
-  async stop(): Promise<void> {
-    log.cycle(0, "Stopping bot");
+			log.cycle(0, 'Strategy tracking initialized', {
+				startingEquity: this.strategyStartingEquity,
+			});
 
-    // Clear interval
-    if (this.cycleInterval) {
-      clearInterval(this.cycleInterval);
-      this.cycleInterval = null;
-    }
+			this.reconstructPosition();
 
-    // Wait for current cycle to complete
-    while (this.isCycleRunning) {
-      log.cycle(0, "Waiting for current cycle to complete");
-      await new Promise((resolve) => setTimeout(resolve, 1000));
-    }
+			this.state = BotState.HEALTHY;
+			log.cycle(0, 'Spread bot initialized successfully', {
+				state: this.state,
+			});
 
-    // Close any open positions
-    if (this.position) {
-      log.cycle(0, "Closing positions before shutdown");
-      await this.closePosition();
-    }
+			return { success: true };
+		} catch (error) {
+			this.state = BotState.EMERGENCY;
+			return {
+				success: false,
+				error: `Bot initialization failed: ${(error as Error).message}`,
+			};
+		}
+	}
 
-    // Cleanup resources
-    await cleanup();
+	private async initializeDrift(): Promise<{
+		success: boolean;
+		error?: string;
+	}> {
+		try {
+			log.cycle(0, 'Initializing Drift client');
 
-    log.cycle(0, "Bot stopped", { totalCycles: this.cycleCount });
-  }
+			const connection = new Connection(config.RPC_HTTP, {
+				wsEndpoint: config.RPC_WS,
+				commitment: 'confirmed',
+			});
 
-  // Main trading cycle
-  private async executeCycle(): Promise<void> {
-    if (this.isCycleRunning) {
-      log.cycle(this.cycleCount + 1, "Previous cycle still running, skipping");
-      return;
-    }
+			const sdk = initialize({ env: TRADING_CONFIG.ENV });
+			const accountLoader = new BulkAccountLoader(
+				connection,
+				'confirmed',
+				1000
+			);
 
-    this.isCycleRunning = true;
-    this.cycleCount++;
-    const cycleStart = process.hrtime.bigint();
+			let secretKey: Uint8Array;
+			try {
+				secretKey = config.PRIVATE_KEY.startsWith('[')
+					? new Uint8Array(JSON.parse(config.PRIVATE_KEY))
+					: Buffer.from(config.PRIVATE_KEY, 'base64');
+			} catch (error) {
+				return {
+					success: false,
+					error: `Failed to parse private key: ${(error as Error).message}`,
+				};
+			}
 
-    try {
-      log.cycle(this.cycleCount, "Cycle started");
+			const wallet = new Wallet(Keypair.fromSecretKey(secretKey));
+			log.cycle(0, 'Wallet loaded', { address: wallet.publicKey.toString() });
 
-      // Health check
-      if (this.state === BotState.EMERGENCY) {
-        log.cycle(this.cycleCount, "Bot in emergency state, closing positions");
-        await this.closePosition();
-        return;
-      }
+			driftClient = new DriftClient({
+				connection,
+				wallet,
+				programID: new PublicKey(sdk.DRIFT_PROGRAM_ID),
+				authority: new PublicKey(config.AUTHORITY_KEY),
+				subAccountIds: [5],
+				activeSubAccountId: 5,
+				accountSubscription: {
+					type: 'websocket',
+					//@ts-ignore
+					accountLoader,
+				},
+			});
 
-      // Fetch market data
-      const marketDataResult = await fetchMarketData();
-      if (!marketDataResult.success) {
-        log.error(
-          "CYCLE",
-          "Failed to fetch market data",
-          new Error(marketDataResult.error)
-        );
-        this.state = BotState.DEGRADED;
-        return;
-      }
+			await driftClient.subscribe();
+			const user = driftClient.getUser();
+			await user.exists();
 
-      const { driftCandles, kmnoCandles } = marketDataResult.data;
+			const driftMarket = PerpMarkets[TRADING_CONFIG.ENV].find(
+				(market) => market.baseAssetSymbol === 'DRIFT'
+			);
+			const kmnoMarket = PerpMarkets[TRADING_CONFIG.ENV].find(
+				(market) => market.baseAssetSymbol === 'KMNO'
+			);
 
-      // Calculate signal
-      const signalResult = calculateSignal(driftCandles, kmnoCandles);
-      if (!signalResult.success) {
-        log.error(
-          "CYCLE",
-          "Failed to calculate signal",
-          new Error(signalResult.error)
-        );
-        return;
-      }
+			if (!driftMarket || !kmnoMarket) {
+				return {
+					success: false,
+					error: 'DRIFT or KMNO market not found',
+				};
+			}
 
-      const { signal, spread, driftPrice, kmnoPrice } = signalResult.data;
-      const signalStr = this.getSignalString(signal);
+			driftMarketIndex = driftMarket.marketIndex;
+			kmnoMarketIndex = kmnoMarket.marketIndex;
 
-      log.cycle(this.cycleCount, "Market data processed", {
-        driftPrice: driftPrice.toFixed(4),
-        kmnoPrice: kmnoPrice.toFixed(4),
-        spread: spread.toFixed(4),
-        signal: signalStr,
-      });
+			log.cycle(0, 'Drift client initialized', {
+				driftMarketIndex,
+				kmnoMarketIndex,
+			});
+			return { success: true };
+		} catch (error) {
+			return {
+				success: false,
+				error: `Drift initialization failed: ${(error as Error).message}`,
+			};
+		}
+	}
 
-      // Determine if position change is needed
-      const currentSignal = this.position?.signal || 0;
-      if (shouldChangePosition(currentSignal, signal)) {
-        await this.transitionPosition(signal);
-      } else {
-        log.cycle(this.cycleCount, "Holding current position", {
-          current: this.getSignalString(currentSignal),
-        });
+	private getCurrentSpreadPosition(): SpreadPosition | null {
+		try {
+			const positions = driftClient.getUser().getUserAccount().perpPositions;
+			let drift = 0;
+			let kmno = 0;
 
-        // Only reconcile when we're NOT making position changes
-        await this.reconcilePosition();
-      }
+			for (const pos of positions) {
+				if (pos.baseAssetAmount.eq(new BN(0))) continue;
 
-      // Log current state
-      await this.logCurrentState();
+				const size = pos.baseAssetAmount.toNumber() / BASE_PRECISION_NUM;
 
-      this.state = BotState.HEALTHY;
-    } catch (error) {
-      log.error("CYCLE", `Cycle ${this.cycleCount} failed`, error as Error);
-      this.state = BotState.DEGRADED;
-    } finally {
-      const cycleTime = Number(process.hrtime.bigint() - cycleStart) / 1e6;
-      log.cycle(this.cycleCount, "Cycle completed", {
-        duration: `${cycleTime.toFixed(1)}ms`,
-      });
-      this.isCycleRunning = false;
-    }
-  }
+				if (pos.marketIndex === driftMarketIndex) {
+					drift = size;
+				}
+				if (pos.marketIndex === kmnoMarketIndex) {
+					kmno = size;
+				}
+			}
 
-  // Transition between positions
-  private async transitionPosition(newSignal: Signal): Promise<void> {
-    const currentSignal = this.position?.signal || 0;
-    const currentStr = this.getSignalString(currentSignal);
-    const newStr = this.getSignalString(newSignal);
+			if (drift === 0 && kmno === 0) {
+				return null;
+			}
 
-    log.cycle(
-      this.cycleCount,
-      `Position transition: ${currentStr} -> ${newStr}`
-    );
+			// Determine signal from positions
+			let signal: Signal = 0;
+			if (drift > 0 && kmno < 0) signal = 1; // Long DRIFT, Short KMNO
+			else if (drift < 0 && kmno > 0) signal = -1; // Short DRIFT, Long KMNO
 
-    try {
-      // Close current position if exists
-      if (this.position) {
-        await this.closePosition();
-      }
+			return { drift, kmno, signal };
+		} catch (error) {
+			log.error('POSITION', 'Failed to get current positions', error as Error);
+			return null;
+		}
+	}
 
-      // Open new position if signal is not flat
-      if (newSignal !== 0) {
-        await this.openPosition(newSignal);
-      }
-    } catch (error) {
-      log.error("TRANSITION", "Position transition failed", error as Error);
-      this.state = BotState.EMERGENCY;
-    }
-  }
+	private async checkLiquidity(
+		marketSymbol: string,
+		side: 'bids' | 'asks',
+		orderSize: number
+	): Promise<LiquidityCheck> {
+		try {
+			const response = await fetch(
+				`https://dlob.drift.trade/l2?marketName=${marketSymbol}`
+			);
+			if (!response.ok) throw new Error(`DLOB API error: ${response.status}`);
 
-  // Open new position
-  private async openPosition(signal: Signal): Promise<void> {
-    const signalStr = this.getSignalString(signal);
-    log.position(`Opening ${signalStr} spread`);
+			const data = (await response.json()) as any;
+			const orders = data[side];
 
-    try {
-      // Check liquidity for both legs
-      const driftDirection =
-        signal > 0 ? PositionDirection.LONG : PositionDirection.SHORT;
-      const kmnoDirection =
-        signal > 0 ? PositionDirection.SHORT : PositionDirection.LONG;
+			if (!orders || orders.length === 0) {
+				return { canFill: false, estimatedSlippage: Infinity };
+			}
 
-      const driftSide =
-        driftDirection === PositionDirection.LONG ? "asks" : "bids";
-      const kmnoSide =
-        kmnoDirection === PositionDirection.LONG ? "asks" : "bids";
+			let totalSize = 0;
+			let totalValue = 0;
+			const bestPrice = +orders[0].price / QUOTE_PRECISION_NUM;
 
-      const [driftLiquidity, kmnoLiquidity] = await Promise.all([
-        checkLiquidity("DRIFT-PERP", driftSide, TRADING_CONFIG.DRIFT_QUANTITY),
-        checkLiquidity("KMNO-PERP", kmnoSide, TRADING_CONFIG.KMNO_QUANTITY),
-      ]);
+			for (let i = 0; i < orders.length; i++) {
+				const order = orders[i];
+				const levelPrice = +order.price / QUOTE_PRECISION_NUM;
+				const levelSize = +order.size / BASE_PRECISION_NUM;
 
-      // Validate trade
-      const validation = validateTrade(driftLiquidity, kmnoLiquidity, false);
-      if (!validation.success) {
-        log.error(
-          "POSITION",
-          "Trade validation failed",
-          new Error(validation.error)
-        );
-        return;
-      }
+				const remaining = orderSize - totalSize;
+				if (remaining <= 0) break;
 
-      // Execute orders sequentially for better control
-      await placeOrder("DRIFT", driftDirection, TRADING_CONFIG.DRIFT_QUANTITY);
-      await placeOrder("KMNO", kmnoDirection, TRADING_CONFIG.KMNO_QUANTITY);
+				const fillSize = levelSize < remaining ? levelSize : remaining;
+				totalValue += fillSize * levelPrice;
+				totalSize += fillSize;
 
-      // Update internal state
-      this.position = {
-        drift: signal * TRADING_CONFIG.DRIFT_QUANTITY,
-        kmno: -signal * TRADING_CONFIG.KMNO_QUANTITY,
-        signal,
-      };
+				if (totalSize >= orderSize) break;
+			}
 
-      log.position(`Successfully opened ${signalStr} spread`, this.position);
-    } catch (error) {
-      log.error(
-        "POSITION",
-        `Failed to open ${signalStr} position`,
-        error as Error
-      );
-      throw error;
-    }
-  }
+			if (totalSize < orderSize) {
+				return { canFill: false, estimatedSlippage: Infinity };
+			}
 
-  // Close current position
-  private async closePosition(): Promise<void> {
-    if (!this.position) {
-      log.position("No position to close");
-      return;
-    }
+			const avgPrice = totalValue / totalSize;
+			const slippage =
+				avgPrice > bestPrice
+					? (avgPrice - bestPrice) / bestPrice
+					: (bestPrice - avgPrice) / bestPrice;
 
-    log.position("Closing position", this.position);
+			return { canFill: true, estimatedSlippage: slippage };
+		} catch (error) {
+			log.error(
+				'LIQUIDITY',
+				`Failed to check ${marketSymbol} ${side}`,
+				error as Error
+			);
+			return { canFill: false, estimatedSlippage: Infinity };
+		}
+	}
 
-    try {
-      // Close DRIFT position
-      if (this.position.drift !== 0) {
-        const direction =
-          this.position.drift > 0
-            ? PositionDirection.SHORT
-            : PositionDirection.LONG;
-        await placeOrder(
-          "DRIFT",
-          direction,
-          Math.abs(this.position.drift),
-          true
-        );
-      }
+	private validateLiquidity(
+		liquidityCheck: LiquidityCheck,
+		marketSymbol: string,
+		isClosing: boolean = false
+	): { success: boolean; error?: string; slippagePercent: number } {
+		if (!liquidityCheck.canFill) {
+			return {
+				success: false,
+				error: `${marketSymbol}: Insufficient market liquidity`,
+				slippagePercent: 0,
+			};
+		}
 
-      // Close KMNO position
-      if (this.position.kmno !== 0) {
-        const direction =
-          this.position.kmno > 0
-            ? PositionDirection.SHORT
-            : PositionDirection.LONG;
-        await placeOrder("KMNO", direction, Math.abs(this.position.kmno), true);
-      }
+		const maxSlippage = isClosing
+			? CLOSE_MAX_SLIPPAGE_DECIMAL
+			: MAX_SLIPPAGE_DECIMAL;
+		const slippagePercent = liquidityCheck.estimatedSlippage * 100;
 
-      this.position = null;
-      log.position("Successfully closed position");
-    } catch (error) {
-      log.error("POSITION", "Failed to close position", error as Error);
-      throw error;
-    }
-  }
+		if (liquidityCheck.estimatedSlippage > maxSlippage) {
+			return {
+				success: false,
+				error: `${marketSymbol}: Slippage too high: ${slippagePercent.toFixed(
+					3
+				)}% > ${(maxSlippage * 100).toFixed(3)}%`,
+				slippagePercent,
+			};
+		}
+		return { success: true, slippagePercent };
+	}
 
-  private async reconstructPositionState(): Promise<void> {
-    const exchangeResult = await getCurrentPositions();
-    if (exchangeResult.success && exchangeResult.data) {
-      this.position = exchangeResult.data;
-      log.cycle(0, "Reconstructed position from exchange", this.position);
-    } else {
-      this.position = null;
-      log.cycle(0, "No existing positions found");
-    }
-  }
+	private reconstructPosition(): void {
+		const position = this.getCurrentSpreadPosition();
+		this.currentPosition = position;
 
-  private async reconcilePosition(): Promise<void> {
-    try {
-      const exchangeResult = await getCurrentPositions();
-      if (!exchangeResult.success) {
-        log.error(
-          "RECONCILE",
-          "Failed to get exchange positions",
-          new Error(exchangeResult.error)
-        );
-        return;
-      }
+		if (position) {
+			log.cycle(0, 'Reconstructed spread position', {
+				signal: getSignalString(position.signal),
+				drift: position.drift,
+				kmno: position.kmno,
+			});
+		} else {
+			log.cycle(0, 'No existing spread position found');
+		}
+	}
 
-      const exchangePosition = exchangeResult.data;
+	start(): void {
+		if (this.state !== BotState.HEALTHY) {
+			log.error(
+				'BOT',
+				'Cannot start bot in non-healthy state',
+				new Error(`Current state: ${this.state}`)
+			);
+			return;
+		}
 
-      if (!this.position && !exchangePosition) {
-        return;
-      }
+		log.cycle(0, 'Starting spread trading');
+		this.executeCycle();
+		this.cycleInterval = setInterval(
+			() => this.executeCycle(),
+			TRADING_CONFIG.CYCLE_INTERVAL_MS
+		);
+	}
 
-      const targetSignal = this.position?.signal || 0;
-      const targetDrift = targetSignal * TRADING_CONFIG.DRIFT_QUANTITY;
-      const targetKmno = -targetSignal * TRADING_CONFIG.KMNO_QUANTITY;
-      const actualDrift = exchangePosition?.drift || 0;
-      const actualKmno = exchangePosition?.kmno || 0;
+	async stop(): Promise<void> {
+		log.cycle(0, 'Stopping bot');
 
-      const driftDiff = Math.abs(actualDrift - targetDrift);
-      const kmnoDiff = Math.abs(actualKmno - targetKmno);
+		if (this.cycleInterval) {
+			clearInterval(this.cycleInterval);
+			this.cycleInterval = null;
+		}
 
-      if (driftDiff <= 0.1 && kmnoDiff <= 0.1) {
-        this.position = exchangePosition;
-        return;
-      }
+		while (this.isCycleRunning) {
+			log.cycle(0, 'Waiting for current cycle to complete');
+			await new Promise((resolve) => setTimeout(resolve, 1000));
+		}
 
-      log.position("Position reconciliation needed", {
-        should: { drift: targetDrift, kmno: targetKmno },
-        actual: { drift: actualDrift, kmno: actualKmno },
-        corrections: { drift: driftDiff, kmno: kmnoDiff },
-      });
+		if (this.currentPosition) {
+			log.cycle(0, 'Closing positions before shutdown');
+			await this.closePosition();
+		}
 
-      // Correct DRIFT position if needed
-      if (driftDiff > 0.1) {
-        let direction: PositionDirection;
-        if (actualDrift > targetDrift) {
-          // Too much DRIFT, need to sell/short
-          direction = PositionDirection.SHORT;
-        } else {
-          // Too little DRIFT, need to buy/long
-          direction = PositionDirection.LONG;
-        }
-        // Reduce=false because may need to open position
-        await placeOrder("DRIFT", direction, driftDiff, false);
-      }
+		if (driftClient) {
+			await driftClient.unsubscribe();
+			log.cycle(0, 'Drift client disconnected');
+		}
 
-      // Correct KMNO position if needed
-      if (kmnoDiff > 0.1) {
-        let direction: PositionDirection;
-        if (actualKmno > targetKmno) {
-          // Too much KMNO, need to sell/short
-          direction = PositionDirection.SHORT;
-        } else {
-          // Too little KMNO, need to buy/long
-          direction = PositionDirection.LONG;
-        }
+		log.cycle(0, 'Bot stopped', { totalCycles: this.cycleCount });
+	}
 
-        // Reduce=false because may need to open position
-        await placeOrder("KMNO", direction, kmnoDiff, false);
-      }
+	private async executeCycle(): Promise<void> {
+		if (this.isCycleRunning) {
+			log.cycle(this.cycleCount + 1, 'Previous cycle still running, skipping');
+			return;
+		}
 
-      this.position = {
-        drift: targetDrift,
-        kmno: targetKmno,
-        signal: targetSignal,
-      };
+		this.isCycleRunning = true;
+		this.cycleCount++;
+		const cycleStart = process.hrtime.bigint();
 
-      log.position("Position correction completed");
-    } catch (error) {
-      log.error("RECONCILE", "Position reconciliation failed", error as Error);
-      this.state = BotState.EMERGENCY;
-    }
-  }
-  // Log current state
-  private async logCurrentState(): Promise<void> {
-    // Log position
-    if (this.position) {
-      log.position("Current position", this.position);
-    }
+		try {
+			log.cycle(this.cycleCount, 'Cycle started');
 
-    // Log account state
-    const accountResult = await getAccountState();
-    if (accountResult.success) {
-      log.position("Account state", accountResult.data);
-    }
-  }
+			if (this.state === BotState.EMERGENCY) {
+				log.cycle(this.cycleCount, 'Bot in emergency state, closing positions');
+				await this.closePosition();
+				return;
+			}
 
-  // Helper to convert signal to string
-  private getSignalString(signal: Signal): string {
-    return signal === 1 ? "LONG" : signal === -1 ? "SHORT" : "FLAT";
-  }
+			const signalData = await getSpreadSignal();
+			const currentSignal = this.currentPosition?.signal || 0;
+			const currentStr = getSignalString(currentSignal);
+			const signalStr = getSignalString(signalData.signal);
 
-  // Get bot status
-  getStatus() {
-    return {
-      state: this.state,
-      position: this.position,
-      cycleCount: this.cycleCount,
-      isRunning: this.isCycleRunning,
-    };
-  }
+			log.cycle(this.cycleCount, 'Signal retrieved', {
+				signal: signalStr,
+				currentPosition: currentStr,
+				spread: signalData.spread.toFixed(4),
+				driftPrice: signalData.driftPrice.toFixed(4),
+				kmnoPrice: signalData.kmnoPrice.toFixed(4),
+			});
+
+			if (signalData.signal !== currentSignal) {
+				await this.changePosition(signalData.signal, currentStr, signalStr);
+			} else {
+				log.cycle(this.cycleCount, 'Holding current position', {
+					position: currentStr,
+				});
+
+				// Only reconcile when we're NOT making position changes
+				await this.reconcilePosition();
+			}
+
+			this.state = BotState.HEALTHY;
+		} catch (error) {
+			log.error('CYCLE', `Cycle ${this.cycleCount} failed`, error as Error);
+			this.state = BotState.EMERGENCY;
+		} finally {
+			const snapshot = await this.capturePerformanceSnapshot();
+			if (snapshot) {
+				log.snapshot(snapshot);
+			}
+			const cycleTime = Number(process.hrtime.bigint() - cycleStart) / 1e6;
+			log.cycle(this.cycleCount, 'Cycle completed', {
+				duration: `${cycleTime.toFixed(1)}ms`,
+			});
+			this.isCycleRunning = false;
+		}
+	}
+
+	private async changePosition(
+		newSignal: Signal,
+		currentStr: string,
+		newStr: string
+	): Promise<void> {
+		log.cycle(
+			this.cycleCount,
+			`Position transition: ${currentStr} -> ${newStr}`
+		);
+
+		try {
+			if (this.currentPosition) {
+				await this.closePosition();
+			}
+
+			if (newSignal !== 0) {
+				await this.openPosition(newSignal);
+			}
+
+			log.position(`Position successfully changed to ${newStr}`);
+		} catch (error) {
+			log.error('TRANSITION', 'Position transition failed', error as Error);
+			this.state = BotState.EMERGENCY;
+			throw error;
+		}
+	}
+
+	private async executeOrder(
+		marketIndex: number,
+		direction: PositionDirection,
+		baseAssetAmount: BN,
+		reduceOnly: boolean,
+		orderType: string
+	): Promise<string> {
+		// Market order with retries
+		for (let attempt = 1; attempt <= RISK_CONFIG.MAX_RETRIES; attempt++) {
+			try {
+				const tx = await driftClient.placePerpOrder({
+					orderType: OrderType.MARKET,
+					marketIndex,
+					direction,
+					baseAssetAmount,
+					reduceOnly,
+				});
+				return tx;
+			} catch (error) {
+				if (attempt === RISK_CONFIG.MAX_RETRIES) {
+					throw new Error(
+						`${orderType} order failed after ${attempt} attempts: ${
+							(error as Error).message
+						}`
+					);
+				}
+
+				const delay = RISK_CONFIG.RETRY_DELAY_MS * Math.pow(2, attempt - 1);
+				log.error(
+					'ORDER',
+					`${orderType} attempt ${attempt} failed, retrying in ${delay}ms`,
+					error as Error
+				);
+				await new Promise((resolve) => setTimeout(resolve, delay));
+			}
+		}
+		throw new Error('Should not reach here');
+	}
+
+	private async openPosition(signal: Signal): Promise<void> {
+		const signalStr = getSignalString(signal);
+		log.position(`Opening ${signalStr} spread`, {
+			driftQuantity: TRADING_CONFIG.DRIFT_QUANTITY,
+			kmnoQuantity: TRADING_CONFIG.KMNO_QUANTITY,
+		});
+
+		const driftDirection =
+			signal > 0 ? PositionDirection.LONG : PositionDirection.SHORT;
+		const kmnoDirection =
+			signal > 0 ? PositionDirection.SHORT : PositionDirection.LONG;
+		const driftSide =
+			driftDirection === PositionDirection.LONG ? 'asks' : 'bids';
+		const kmnoSide = kmnoDirection === PositionDirection.LONG ? 'asks' : 'bids';
+
+		// Check liquidity for both legs
+		const [driftLiquidity, kmnoLiquidity] = await Promise.all([
+			this.checkLiquidity(
+				'DRIFT-PERP',
+				driftSide,
+				TRADING_CONFIG.DRIFT_QUANTITY
+			),
+			this.checkLiquidity('KMNO-PERP', kmnoSide, TRADING_CONFIG.KMNO_QUANTITY),
+		]);
+
+		const driftValidation = this.validateLiquidity(
+			driftLiquidity,
+			'DRIFT',
+			false
+		);
+		const kmnoValidation = this.validateLiquidity(kmnoLiquidity, 'KMNO', false);
+
+		if (!driftValidation.success || !kmnoValidation.success) {
+			const error = !driftValidation.success
+				? driftValidation.error
+				: kmnoValidation.error;
+			log.error('POSITION', 'Liquidity validation failed', new Error(error));
+			return;
+		}
+
+		log.position('Liquidity check passed', {
+			driftSlippage: `${driftValidation.slippagePercent.toFixed(3)}%`,
+			kmnoSlippage: `${kmnoValidation.slippagePercent.toFixed(3)}%`,
+		});
+
+		// Execute orders sequentially for better control
+		const driftBaseAmount = new BN(DRIFT_QUANTITY_SCALED);
+		const kmnoBaseAmount = new BN(KMNO_QUANTITY_SCALED);
+
+		const driftTx = await this.executeOrder(
+			driftMarketIndex,
+			driftDirection,
+			driftBaseAmount,
+			false,
+			'Open DRIFT'
+		);
+
+		const kmnoTx = await this.executeOrder(
+			kmnoMarketIndex,
+			kmnoDirection,
+			kmnoBaseAmount,
+			false,
+			'Open KMNO'
+		);
+
+		// Update internal state
+		this.currentPosition = {
+			drift: signal * TRADING_CONFIG.DRIFT_QUANTITY,
+			kmno: -signal * TRADING_CONFIG.KMNO_QUANTITY,
+			signal,
+		};
+
+		log.order('OPEN', 'SPREAD', `${signalStr} spread opened`, {
+			driftTx,
+			kmnoTx,
+			driftQuantity: TRADING_CONFIG.DRIFT_QUANTITY,
+			kmnoQuantity: TRADING_CONFIG.KMNO_QUANTITY,
+		});
+	}
+	private calculatePositionPnl(
+		signal: Signal,
+		size: number,
+		entryPrice: number,
+		currentPrice: number
+	): number {
+		const positionValue = size * currentPrice;
+		const entryValue = size * entryPrice;
+		return signal > 0 ? positionValue - entryValue : entryValue - positionValue;
+	}
+
+	private getDriftPositionEntryPrice(): number {
+		const perpPosition = driftClient
+			.getUser()
+			.getPerpPosition(driftMarketIndex);
+		if (!perpPosition || perpPosition.baseAssetAmount.eq(new BN(0))) return 0;
+
+		return (
+			((perpPosition.quoteEntryAmount.abs().toNumber() /
+				perpPosition.baseAssetAmount.abs().toNumber()) *
+				BASE_PRECISION_NUM) /
+			QUOTE_PRECISION_NUM
+		);
+	}
+
+	private getKmnoPositionEntryPrice(): number {
+		const perpPosition = driftClient.getUser().getPerpPosition(kmnoMarketIndex);
+		if (!perpPosition || perpPosition.baseAssetAmount.eq(new BN(0))) return 0;
+
+		return (
+			((perpPosition.quoteEntryAmount.abs().toNumber() /
+				perpPosition.baseAssetAmount.abs().toNumber()) *
+				BASE_PRECISION_NUM) /
+			QUOTE_PRECISION_NUM
+		);
+	}
+
+	private async closePosition(): Promise<void> {
+		const position = this.getCurrentSpreadPosition();
+
+		if (!position) {
+			log.position('No position to close');
+			this.currentPosition = null;
+			return;
+		}
+
+		const driftEntryPrice = this.getDriftPositionEntryPrice();
+		const kmnoEntryPrice = this.getKmnoPositionEntryPrice();
+		const currentStr = getSignalString(position.signal);
+
+		// Determine close directions
+		const driftDirection =
+			position.drift > 0 ? PositionDirection.SHORT : PositionDirection.LONG;
+		const kmnoDirection =
+			position.kmno > 0 ? PositionDirection.SHORT : PositionDirection.LONG;
+
+		const driftSide =
+			driftDirection === PositionDirection.LONG ? 'asks' : 'bids';
+		const kmnoSide = kmnoDirection === PositionDirection.LONG ? 'asks' : 'bids';
+
+		const driftSize = Math.abs(position.drift);
+		const kmnoSize = Math.abs(position.kmno);
+
+		log.position(`Closing ${currentStr} spread`, {
+			driftSize,
+			kmnoSize,
+		});
+
+		// Check liquidity for close
+		const [driftLiquidity, kmnoLiquidity] = await Promise.all([
+			this.checkLiquidity('DRIFT-PERP', driftSide, driftSize),
+			this.checkLiquidity('KMNO-PERP', kmnoSide, kmnoSize),
+		]);
+
+		const driftValidation = this.validateLiquidity(
+			driftLiquidity,
+			'DRIFT',
+			true
+		);
+		const kmnoValidation = this.validateLiquidity(kmnoLiquidity, 'KMNO', true);
+
+		if (!driftValidation.success || !kmnoValidation.success) {
+			log.risk('Close liquidity validation failed, forcing close anyway', {
+				driftError: driftValidation.error,
+				kmnoError: kmnoValidation.error,
+			});
+		} else {
+			log.position('Close liquidity check passed', {
+				driftSlippage: `${driftValidation.slippagePercent.toFixed(3)}%`,
+				kmnoSlippage: `${kmnoValidation.slippagePercent.toFixed(3)}%`,
+			});
+		}
+
+		// Execute close orders
+		const driftBaseAmount = new BN(driftSize * BASE_PRECISION_NUM);
+		const kmnoBaseAmount = new BN(kmnoSize * BASE_PRECISION_NUM);
+
+		const driftTx = await this.executeOrder(
+			driftMarketIndex,
+			driftDirection,
+			driftBaseAmount,
+			true,
+			'Close DRIFT'
+		);
+
+		const kmnoTx = await this.executeOrder(
+			kmnoMarketIndex,
+			kmnoDirection,
+			kmnoBaseAmount,
+			true,
+			'Close KMNO'
+		);
+
+		// Get close prices after order execution
+		const driftMarket = driftClient.getPerpMarketAccount(
+			driftMarketIndex
+		) as PerpMarketAccount;
+		const kmnoMarket = driftClient.getPerpMarketAccount(
+			kmnoMarketIndex
+		) as PerpMarketAccount;
+
+		const driftClosePrice =
+			driftMarket.amm.lastMarkPriceTwap.toNumber() / QUOTE_PRECISION_NUM;
+		const kmnoClosePrice =
+			kmnoMarket.amm.lastMarkPriceTwap.toNumber() / QUOTE_PRECISION_NUM;
+
+		// Calculate realized PnL after execution
+		if (driftEntryPrice > 0 || kmnoEntryPrice > 0) {
+			let totalRealizedPnl = 0;
+
+			if (driftEntryPrice > 0) {
+				const driftPnl = this.calculatePositionPnl(
+					position.drift > 0 ? 1 : -1,
+					driftSize,
+					driftEntryPrice,
+					driftClosePrice
+				);
+				totalRealizedPnl += driftPnl;
+			}
+
+			if (kmnoEntryPrice > 0) {
+				const kmnoPnl = this.calculatePositionPnl(
+					position.kmno > 0 ? 1 : -1,
+					kmnoSize,
+					kmnoEntryPrice,
+					kmnoClosePrice
+				);
+				totalRealizedPnl += kmnoPnl;
+			}
+
+			this.strategyRealizedPnl += totalRealizedPnl;
+
+			log.position('Spread position closed with realized PnL', {
+				driftEntry: driftEntryPrice.toFixed(2),
+				driftClose: driftClosePrice.toFixed(2),
+				kmnoEntry: kmnoEntryPrice.toFixed(2),
+				kmnoClose: kmnoClosePrice.toFixed(2),
+				totalRealizedPnl: totalRealizedPnl.toFixed(6),
+				totalStrategyPnl: this.strategyRealizedPnl.toFixed(6),
+			});
+		}
+
+		log.order('CLOSE', 'SPREAD', `${currentStr} spread closed`, {
+			driftTx,
+			kmnoTx,
+			driftQuantity: driftSize,
+			kmnoQuantity: kmnoSize,
+			driftSlippage: `${driftValidation.slippagePercent.toFixed(3)}%`,
+			kmnoSlippage: `${kmnoValidation.slippagePercent.toFixed(3)}%`,
+		});
+
+		this.currentPosition = null;
+	}
+
+	private async capturePerformanceSnapshot(): Promise<PerformanceSnapshot | null> {
+		try {
+			const user = driftClient.getUser();
+
+			const accountEquity =
+				user.getTotalCollateral().toNumber() / QUOTE_PRECISION_NUM;
+			const accountUnrealizedPnl =
+				user.getUnrealizedPNL().toNumber() / QUOTE_PRECISION_NUM;
+
+			const strategyEquity =
+				this.strategyStartingEquity + this.strategyRealizedPnl;
+
+			// Get current spread data
+			const signalData = await getSpreadSignal();
+
+			return {
+				timestamp: Date.now(),
+				cycle: this.cycleCount,
+				accountEquity,
+				accountUnrealizedPnl,
+				strategyEquity,
+				strategyRealizedPnl: this.strategyRealizedPnl,
+				spread: {
+					driftPrice: signalData.driftPrice,
+					kmnoPrice: signalData.kmnoPrice,
+					spreadValue: signalData.spread,
+				},
+				positions: {
+					drift: this.currentPosition?.drift || 0,
+					kmno: this.currentPosition?.kmno || 0,
+				},
+			};
+		} catch (error) {
+			log.error('PERFORMANCE', 'Failed to capture snapshot', error as Error);
+			return null;
+		}
+	}
+
+	private async reconcilePosition(): Promise<void> {
+		try {
+			const exchangePosition = this.getCurrentSpreadPosition();
+
+			if (!this.currentPosition && !exchangePosition) {
+				return;
+			}
+
+			const targetSignal = this.currentPosition?.signal || 0;
+			const targetDrift = targetSignal * TRADING_CONFIG.DRIFT_QUANTITY;
+			const targetKmno = -targetSignal * TRADING_CONFIG.KMNO_QUANTITY;
+			const actualDrift = exchangePosition?.drift || 0;
+			const actualKmno = exchangePosition?.kmno || 0;
+
+			const driftDiff = Math.abs(actualDrift - targetDrift);
+			const kmnoDiff = Math.abs(actualKmno - targetKmno);
+
+			if (driftDiff <= 0.1 && kmnoDiff <= 0.1) {
+				this.currentPosition = exchangePosition;
+				return;
+			}
+
+			log.position('Position reconciliation needed', {
+				should: { drift: targetDrift, kmno: targetKmno },
+				actual: { drift: actualDrift, kmno: actualKmno },
+				corrections: { drift: driftDiff, kmno: kmnoDiff },
+			});
+
+			// Correct DRIFT position if needed
+			if (driftDiff > 0.1) {
+				let direction: PositionDirection;
+				if (actualDrift > targetDrift) {
+					// Too much DRIFT, need to sell/short
+					direction = PositionDirection.SHORT;
+				} else {
+					// Too little DRIFT, need to buy/long
+					direction = PositionDirection.LONG;
+				}
+
+				const driftBaseAmount = new BN(driftDiff * BASE_PRECISION_NUM);
+				await this.executeOrder(
+					driftMarketIndex,
+					direction,
+					driftBaseAmount,
+					false,
+					'Reconcile DRIFT'
+				);
+			}
+
+			// Correct KMNO position if needed
+			if (kmnoDiff > 0.1) {
+				let direction: PositionDirection;
+				if (actualKmno > targetKmno) {
+					// Too much KMNO, need to sell/short
+					direction = PositionDirection.SHORT;
+				} else {
+					// Too little KMNO, need to buy/long
+					direction = PositionDirection.LONG;
+				}
+
+				const kmnoBaseAmount = new BN(kmnoDiff * BASE_PRECISION_NUM);
+				await this.executeOrder(
+					kmnoMarketIndex,
+					direction,
+					kmnoBaseAmount,
+					false,
+					'Reconcile KMNO'
+				);
+			}
+
+			this.currentPosition = {
+				drift: targetDrift,
+				kmno: targetKmno,
+				signal: targetSignal,
+			};
+
+			log.position('Position reconciliation completed');
+		} catch (error) {
+			log.error('RECONCILE', 'Position reconciliation failed', error as Error);
+			this.state = BotState.EMERGENCY;
+		}
+	}
 }
